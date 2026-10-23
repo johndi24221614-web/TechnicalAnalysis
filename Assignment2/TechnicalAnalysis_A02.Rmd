@@ -1,0 +1,238 @@
+---
+title: "BDA400 - Assignment 2: Technical Analysis using R (Preliminary Stage)"
+author: "John Diaz"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Packages
+
+Install once (run in the console), then load every time.
+
+```{r packages, eval=FALSE}
+install.packages(c("quantmod", "TTR", "ggplot2", "knitr", "rmarkdown"))
+```
+
+```{r libraries}
+library(quantmod)  # download and chart financial data
+library(TTR)       # technical trading rules (SMA, etc.)
+```
+
+# 2. Configuration
+
+The portfolio is read from `portfolio.txt` (one symbol per line).
+
+```{r config}
+portfolio_file <- "portfolio.txt"
+start_date     <- as.Date("2023-01-01")
+end_date       <- Sys.Date()
+ma_window      <- 20   # moving average window (trading days)
+```
+
+# 3. Function: load_stock_data()
+
+Reads the symbols from the text file and imports the data of each one with
+`quantmod::getSymbols()`. Returns a named list with one data frame per symbol.
+A symbol that fails to download is reported and skipped, so one bad ticker does
+not stop the rest.
+
+```{r load-function}
+load_stock_data <- function(file = portfolio_file,
+                            from = start_date,
+                            to   = end_date) {
+  if (!file.exists(file)) stop("File not found: ", file)
+
+  symbols <- trimws(readLines(file, warn = FALSE))
+  symbols <- unique(toupper(symbols[symbols != ""]))
+
+  stocks <- list()
+  for (sym in symbols) {
+    xts_data <- tryCatch(
+      getSymbols(sym, src = "yahoo", from = from, to = to, auto.assign = FALSE),
+      error = function(e) {
+        message("Could not download ", sym, ": ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (is.null(xts_data)) next
+
+    df <- data.frame(Date = index(xts_data), coredata(xts_data))
+    colnames(df) <- c("Date", "Open", "High", "Low", "Close", "Volume", "Adjusted")
+    stocks[[sym]] <- df
+  }
+  stocks
+}
+```
+
+```{r load-data}
+stocks <- load_stock_data()
+names(stocks)
+```
+
+# 4. Function: calculate_statistics()
+
+Takes one stock data frame and returns the requested statistics on the closing
+price: moving average, mean, mode, median and standard deviation.
+
+R has no built-in statistical mode (`mode()` returns the object type), so a
+small helper is defined. Prices are rounded to 2 decimals so repeated values
+can be found.
+
+```{r stats-function}
+get_mode <- function(x) {
+  x  <- round(x, 2)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+calculate_statistics <- function(df, window = ma_window) {
+  close <- df$Close
+  ma    <- SMA(close, n = window)
+
+  list(
+    summary = data.frame(
+      Mean              = mean(close, na.rm = TRUE),
+      Median            = median(close, na.rm = TRUE),
+      Mode              = get_mode(close),
+      StdDev            = sd(close, na.rm = TRUE),
+      Latest_MovingAvg  = tail(ma[!is.na(ma)], 1),
+      Observations      = length(close)
+    ),
+    moving_average = data.frame(Date = df$Date, Close = close, MA = ma)
+  )
+}
+```
+
+```{r compute-stats}
+stats <- lapply(stocks, calculate_statistics)
+
+# One summary table with a row per stock
+stats_table <- do.call(rbind, lapply(names(stats), function(s) {
+  cbind(Symbol = s, stats[[s]]$summary)
+}))
+rownames(stats_table) <- NULL
+stats_table[, -1] <- round(stats_table[, -1], 2)
+stats_table
+```
+
+# 5. Display utilities
+
+Several ways of presenting the same data, similar to Yahoo Finance.
+
+```{r display-functions}
+# (a) First and last rows of each stock's data frame
+display_data_frames <- function(stocks, n = 5) {
+  for (sym in names(stocks)) {
+    cat("\n=====", sym, "=====\n")
+    cat("Rows:", nrow(stocks[[sym]]), "| From:", as.character(min(stocks[[sym]]$Date)),
+        "To:", as.character(max(stocks[[sym]]$Date)), "\n")
+    print(head(stocks[[sym]], n))
+    cat("...\n")
+    print(tail(stocks[[sym]], n))
+  }
+}
+
+# (b) Quote summary: latest price, daily change, 52-week range
+display_quote_summary <- function(stocks) {
+  rows <- lapply(names(stocks), function(sym) {
+    d      <- stocks[[sym]]
+    last   <- tail(d, 1)
+    prev   <- tail(d, 2)[1, ]
+    last52 <- d[d$Date >= (max(d$Date) - 365), ]
+    data.frame(
+      Symbol     = sym,
+      Last       = round(last$Close, 2),
+      Change     = round(last$Close - prev$Close, 2),
+      Change_Pct = round((last$Close / prev$Close - 1) * 100, 2),
+      Low_52w    = round(min(last52$Low), 2),
+      High_52w   = round(max(last52$High), 2),
+      Volume     = last$Volume
+    )
+  })
+  do.call(rbind, rows)
+}
+
+# (c) Price chart with moving average for one stock
+plot_price_ma <- function(sym) {
+  m <- stats[[sym]]$moving_average
+  plot(m$Date, m$Close, type = "l", col = "steelblue", lwd = 1.5,
+       xlab = "Date", ylab = "Close price (USD)",
+       main = paste0(sym, " - Close and ", ma_window, "-day moving average"))
+  lines(m$Date, m$MA, col = "firebrick", lwd = 2)
+  legend("topleft", legend = c("Close", paste0(ma_window, "-day MA")),
+         col = c("steelblue", "firebrick"), lwd = c(1.5, 2), bty = "n")
+}
+
+# (d) Candlestick chart with volume (quantmod)
+plot_candlestick <- function(sym, last_days = 90) {
+  d   <- tail(stocks[[sym]], last_days)
+  x   <- xts::xts(d[, c("Open", "High", "Low", "Close", "Volume", "Adjusted")],
+                  order.by = d$Date)
+  chartSeries(x, name = paste(sym, "- last", last_days, "days"),
+              type = "candlesticks", theme = chartTheme("white"),
+              TA = "addVo();addSMA(n=20)")
+}
+
+# (e) Histogram of closing prices with mean and median
+plot_histogram <- function(sym) {
+  close <- stocks[[sym]]$Close
+  hist(close, breaks = 30, col = "lightgray", border = "white",
+       main = paste(sym, "- Distribution of closing prices"),
+       xlab = "Close price (USD)")
+  abline(v = mean(close),   col = "firebrick", lwd = 2)
+  abline(v = median(close), col = "steelblue", lwd = 2, lty = 2)
+  legend("topright", legend = c("Mean", "Median"),
+         col = c("firebrick", "steelblue"), lwd = 2, lty = c(1, 2), bty = "n")
+}
+```
+
+## 5.1 Loaded data frames
+
+```{r show-df}
+display_data_frames(stocks, n = 5)
+```
+
+## 5.2 Quote summary
+
+```{r show-quotes}
+display_quote_summary(stocks)
+```
+
+## 5.3 Statistics per stock
+
+```{r show-stats}
+stats_table
+```
+
+## 5.4 Price with moving average
+
+```{r plots-ma, fig.width=8, fig.height=4}
+for (sym in names(stocks)) plot_price_ma(sym)
+```
+
+## 5.5 Candlestick charts
+
+```{r plots-candle, fig.width=8, fig.height=5}
+for (sym in names(stocks)) plot_candlestick(sym)
+```
+
+## 5.6 Distribution of closing prices
+
+```{r plots-hist, fig.width=7, fig.height=4}
+for (sym in names(stocks)) plot_histogram(sym)
+```
+
+## 5.7 Comparison of average closing price
+
+```{r plot-compare, fig.width=7, fig.height=4}
+barplot(stats_table$Mean, names.arg = stats_table$Symbol, col = "steelblue",
+        main = "Mean closing price by stock", ylab = "USD")
+```

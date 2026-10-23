@@ -1,0 +1,6 @@
+AAPL
+MSFT
+TSLA
+GM
+F
+TM
